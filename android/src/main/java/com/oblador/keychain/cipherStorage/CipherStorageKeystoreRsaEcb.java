@@ -32,6 +32,7 @@ import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import javax.crypto.Cipher;
 import javax.crypto.NoSuchPaddingException;
 
 /** Fingerprint biometry protected storage. */

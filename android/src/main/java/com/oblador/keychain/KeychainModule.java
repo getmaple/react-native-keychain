@@ -11,6 +11,8 @@ import androidx.annotation.StringDef;
 import androidx.biometric.BiometricPrompt;
 import androidx.biometric.BiometricPrompt.PromptInfo;
 import androidx.fragment.app.FragmentActivity;
+import androidx.core.hardware.fingerprint.FingerprintManagerCompat;
+import androidx.core.os.CancellationSignal;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.AssertionException;
@@ -20,6 +22,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
 import com.oblador.keychain.PrefsStorage.ResultSet;
 import com.oblador.keychain.cipherStorage.CipherStorage;
 import com.oblador.keychain.cipherStorage.CipherStorage.DecryptionContext;
@@ -90,6 +93,7 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     String SERVICE = "service";
     String SECURITY_LEVEL = "securityLevel";
     String RULES = "rules";
+    String ENABLE_FINGERPRINT_AUTHENTICATION_FALLBACK = "enableFingerprintAuthenticationFallback";
 
     String USERNAME = "username";
     String PASSWORD = "password";
@@ -104,6 +108,13 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     String E_SUPPORTED_BIOMETRY_ERROR = "E_SUPPORTED_BIOMETRY_ERROR";
     /** Raised for unexpected errors. */
     String E_UNKNOWN_ERROR = "E_UNKNOWN_ERROR";
+  }
+
+  /** All events by name that can be fired by this module */
+  @interface EventNames {
+    String ON_FALLBACK_AUTHENTICATION_START = "onFallbackAuthenticationStart";
+    String ON_FALLBACK_AUTHENTICATION_SUCCESS = "onFallbackAuthenticationSuccess";
+    String ON_FALLBACK_AUTHENTICATION_FAILURE = "onFallbackAuthenticationFailure";
   }
 
   /** Supported ciphers. */
@@ -130,6 +141,21 @@ public class KeychainModule extends ReactContextBaseJavaModule {
   private final Map<String, CipherStorage> cipherStorageMap = new HashMap<>();
   /** Shared preferences storage. */
   private final PrefsStorage prefsStorage;
+
+  /**
+   * Tracks whether or not fingerprint-only authentication should be attempted the next time we go to authenticate the
+   * user to decrypt something from the keystore.
+   *
+   * Some devices misreport weak sensors as strong ones capable of retrieving secure keystore values, see
+   * https://android-review.googlesource.com/c/platform/frameworks/support/+/1145111/ for partial list of known
+   * devices with weak sensors misreported as strong.
+   */
+  private boolean shouldAttemptFingerprintAuthenticationFallback = false;
+
+  /**
+   * For fallback authentication handling and cancelling the attempt from JS.
+   */
+  private CancellationSignal signal;
   //endregion
 
   //region Initialization
@@ -276,6 +302,8 @@ public class KeychainModule extends ReactContextBaseJavaModule {
   protected void getGenericPassword(@NonNull final String alias,
                                     @Nullable final ReadableMap options,
                                     @NonNull final Promise promise) {
+    final boolean isFingerprintAuthenticationFallbackEnabled = getFingerprintAuthenticationFallbackStatus(options);
+
     try {
       final ResultSet resultSet = prefsStorage.getEncryptedEntry(alias);
 
@@ -306,6 +334,26 @@ public class KeychainModule extends ReactContextBaseJavaModule {
 
       promise.reject(Errors.E_KEYSTORE_ACCESS_ERROR, e);
     } catch (CryptoFailedException e) {
+      /**
+       * Only if we want to perform fallback, we have enrolled fingerprints, and authentication failed do we want to
+       * attempt fallback.
+       *
+       * Due to lack of APIs to check what you authenticated with until Android 11 and a lack of a return status that
+       * matches what the device would do with hardware on biometric prompt (device shows face unlock option but
+       * we can't check if it face enrolled), assume that this failure occurred due to face unlcok and attempt
+       * authentication again but with fingerprint-only in this same invocation.
+       */
+      if (isFingerprintAuthenticationFallbackEnabled
+          && !shouldAttemptFingerprintAuthenticationFallback
+          && e.getMessage().contains("User not authenticated") && isFingerprintAuthAvailable())
+      {
+        shouldAttemptFingerprintAuthenticationFallback = true;
+
+        getGenericPassword(alias, options, promise);
+
+        return;
+      }
+
       Log.e(KEYCHAIN_MODULE, e.getMessage());
 
       promise.reject(Errors.E_CRYPTO_FAILED, e);
@@ -313,6 +361,9 @@ public class KeychainModule extends ReactContextBaseJavaModule {
       Log.e(KEYCHAIN_MODULE, fail.getMessage(), fail);
 
       promise.reject(Errors.E_UNKNOWN_ERROR, fail);
+    } finally {
+      // In case we had to fallback, ensure internal state is reset so it doesn't always default to fallback.
+      shouldAttemptFingerprintAuthenticationFallback = false;
     }
   }
 
@@ -432,6 +483,15 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     final boolean useBiometry = getUseBiometry(accessControl);
 
     promise.resolve(getSecurityLevel(useBiometry).name());
+  }
+
+  @ReactMethod
+  public void stopFallbackAuthentication() {
+    if (signal == null) {
+      return;
+    }
+
+    signal.cancel();
   }
   //endregion
 
@@ -572,6 +632,14 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     return promptInfo;
   }
 
+  private static boolean getFingerprintAuthenticationFallbackStatus(@Nullable final ReadableMap options) {
+    if (null == options || !options.hasKey(Maps.ENABLE_FINGERPRINT_AUTHENTICATION_FALLBACK)) {
+      return false;
+    }
+
+    return options.getBoolean(Maps.ENABLE_FINGERPRINT_AUTHENTICATION_FALLBACK);
+  }
+
   /**
    * Extract credentials from current storage. In case if current storage is not matching
    * results set then executed migration.
@@ -634,8 +702,8 @@ public class KeychainModule extends ReactContextBaseJavaModule {
   /** Get instance of handler that resolves access to the keystore on system request. */
   @NonNull
   protected DecryptionResultHandler getInteractiveHandler(@NonNull final CipherStorage current, @NonNull final PromptInfo promptInfo) {
-    if (current.isBiometrySupported() /*&& isFingerprintAuthAvailable()*/) {
-      return new InteractiveBiometric(current, promptInfo);
+    if (current.isBiometrySupported()) {
+      return new InteractiveBiometric(current, promptInfo, shouldAttemptFingerprintAuthenticationFallback);
     }
 
     return new NonInteractiveHandler();
@@ -791,6 +859,30 @@ public class KeychainModule extends ReactContextBaseJavaModule {
   private static String getAliasOrDefault(@Nullable final String service) {
     return service == null ? EMPTY_STRING : service;
   }
+
+  @NonNull
+  private WritableMap createOnFailureEventParams(final boolean shouldHideUI,
+                                                 @Nullable final CharSequence message)
+  {
+    final WritableMap params = Arguments.createMap();
+
+    params.putBoolean("shouldHideUI", shouldHideUI);
+
+    if (message != null && message.length() > 0) {
+      params.putString("message", message.toString());
+    }
+
+    return params;
+  }
+
+  /**
+    * Helper to send events with parameters over the bridge.
+    */
+  private void sendNativeEvent(String eventName, @Nullable WritableMap params) {
+    getReactApplicationContext()
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+      .emit(eventName, params);
+  }
   //endregion
 
   //region Nested declarations
@@ -803,10 +895,15 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     private final Executor executor = Executors.newSingleThreadExecutor();
     private DecryptionContext context;
     private PromptInfo promptInfo;
+    private final boolean forceFingerprintAuthentication;
 
-    private InteractiveBiometric(@NonNull final CipherStorage storage, @NonNull final PromptInfo promptInfo) {
+    private InteractiveBiometric(@NonNull final CipherStorage storage,
+                                 @NonNull final PromptInfo promptInfo,
+                                 @NonNull final boolean forceFingerprintAuthentication)
+    {
       this.storage = (CipherStorageBase) storage;
       this.promptInfo = promptInfo;
+      this.forceFingerprintAuthentication = forceFingerprintAuthentication;
     }
 
     @Override
@@ -856,6 +953,16 @@ public class KeychainModule extends ReactContextBaseJavaModule {
     /** Called when a biometric is recognized. */
     @Override
     public void onAuthenticationSucceeded(@NonNull final BiometricPrompt.AuthenticationResult result) {
+      handleAuthenticationSuccess();
+    }
+
+    /**
+     * Attempts to decrypt keystore entry.
+     *
+     * Should only be called after some successful authentication process, either by the BiometricPrompt or the
+     * FingerprintManager (and variants).
+     */
+    private void handleAuthenticationSuccess() {
       try {
         if (null == context) throw new NullPointerException("Decrypt context is not assigned yet.");
 
@@ -882,9 +989,15 @@ public class KeychainModule extends ReactContextBaseJavaModule {
         return;
       }
 
-      final BiometricPrompt prompt = new BiometricPrompt(activity, executor, this);
+      if (forceFingerprintAuthentication) {
+        final FingerprintManagerListener listener = new FingerprintManagerListener();
 
-      prompt.authenticate(this.promptInfo);
+        listener.authenticate();
+      } else {
+        final BiometricPrompt prompt = new BiometricPrompt(activity, executor, this);
+
+        prompt.authenticate(this.promptInfo);
+      }
     }
 
     /** Block current NON-main thread and wait for user authentication results. */
@@ -905,6 +1018,69 @@ public class KeychainModule extends ReactContextBaseJavaModule {
 
       Log.i(KEYCHAIN_MODULE, "unblocking thread.");
     }
+
+    //region Deeply nested declarations for device workarounds
+
+    /**
+     * Class that handles authentication and decrypting when fingerprint authentication succeeds.
+     *
+     * Does nothing on its own and instead defers to given method references for implementation details, acting as an
+     * interface implementation for authentication purposes.
+     */
+    private class FingerprintManagerListener extends FingerprintManagerCompat.AuthenticationCallback {
+      @Override
+      public void onAuthenticationError(int errMsgId, CharSequence errString) {
+        final WritableMap params = KeychainModule.this.createOnFailureEventParams(true, errString);
+
+        KeychainModule.this.sendNativeEvent(EventNames.ON_FALLBACK_AUTHENTICATION_FAILURE, params);
+      }
+
+      @Override
+      public void onAuthenticationHelp(int helpCode, CharSequence helpString) {
+        final WritableMap params = KeychainModule.this.createOnFailureEventParams(false, helpString);
+
+        KeychainModule.this.sendNativeEvent(EventNames.ON_FALLBACK_AUTHENTICATION_FAILURE, params);
+      }
+
+      @Override
+      public void onAuthenticationSucceeded(FingerprintManagerCompat.AuthenticationResult result) {
+        InteractiveBiometric.this.handleAuthenticationSuccess();
+
+        if (InteractiveBiometric.this.getError() != null) {
+          final WritableMap params = KeychainModule.this.createOnFailureEventParams(false, null);
+
+          KeychainModule.this.sendNativeEvent(
+            EventNames.ON_FALLBACK_AUTHENTICATION_FAILURE,
+            params
+          );
+        } else if (InteractiveBiometric.this.getResult() != null) {
+          KeychainModule.this.sendNativeEvent(EventNames.ON_FALLBACK_AUTHENTICATION_SUCCESS,null);
+        }
+      }
+
+      @Override
+      public void onAuthenticationFailed() {
+        final WritableMap params = KeychainModule.this.createOnFailureEventParams(false, null);
+
+        KeychainModule.this.sendNativeEvent(EventNames.ON_FALLBACK_AUTHENTICATION_FAILURE, params);
+      }
+
+      public void authenticate() {
+        try {
+          KeychainModule.this.signal = new CancellationSignal();
+
+          final FingerprintManagerCompat fm = FingerprintManagerCompat.from(getReactApplicationContext());
+
+          KeychainModule.this.sendNativeEvent(EventNames.ON_FALLBACK_AUTHENTICATION_START, null);
+
+          fm.authenticate(null, 0, KeychainModule.this.signal, this, null);
+        } catch (final Throwable error) {
+          InteractiveBiometric.this.onDecrypt(null, error);
+        }
+      }
+    }
+
+    //endregion
   }
   //endregion
 }
