@@ -375,6 +375,10 @@ const emitter = Platform.OS === 'android'
  */
 export function stopFallbackAuthentication() {
   if (Platform.OS === 'android') {
+    if (!RNKeychainManager.stopFallbackAuthentication) {
+      return;
+    }
+
     RNKeychainManager.stopFallbackAuthentication();
   }
 }
