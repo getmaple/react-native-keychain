@@ -390,7 +390,7 @@ export function stopFallbackAuthentication() {
  */
 export function addOnFallbackAuthenticationStartListener(listener: () => void) {
   if (emitter) {
-    emitter.addListener('onFallbackAuthenticationStart', listener);
+    return emitter.addListener('onFallbackAuthenticationStart', listener);
   }
 }
 
@@ -402,7 +402,7 @@ export function addOnFallbackAuthenticationStartListener(listener: () => void) {
  */
 export function addOnFallbackAuthenticationSuccessListener(listener: () => void) {
   if (emitter) {
-    emitter.addListener('onFallbackAuthenticationSuccess', listener);
+    return emitter.addListener('onFallbackAuthenticationSuccess', listener);
   }
 }
 
@@ -424,7 +424,7 @@ type OnFailureEvent = {|
  */
 export function addOnFallbackAuthenticationFailureListener(listener: (event: OnFailureEvent) => void) {
   if (emitter) {
-    emitter.addListener('onFallbackAuthenticationFailure', listener);
+    return emitter.addListener('onFallbackAuthenticationFailure', listener);
   }
 }
 
