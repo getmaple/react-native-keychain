@@ -983,7 +983,7 @@ public class KeychainModule extends ReactContextBaseJavaModule {
       if (null == activity) throw new NullPointerException("Not assigned current activity");
 
       // code can be executed only from MAIN thread
-      if (Thread.currentThread() != Looper.getMainLooper().getThread()) {
+      if (!forceFingerprintAuthentication && Thread.currentThread() != Looper.getMainLooper().getThread()) {
         activity.runOnUiThread(this::startAuthentication);
         waitResult();
         return;
@@ -993,6 +993,7 @@ public class KeychainModule extends ReactContextBaseJavaModule {
         final FingerprintManagerListener listener = new FingerprintManagerListener();
 
         listener.authenticate();
+        waitResult();
       } else {
         final BiometricPrompt prompt = new BiometricPrompt(activity, executor, this);
 
